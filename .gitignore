@@ -1,5 +1,8 @@
 # Build
 target/
+# Library crate — Cargo.lock is not committed (matches crates.io convention
+# for libraries; consumers resolve against their own lockfile).
+Cargo.lock
 node_modules/
 dist/
 build/

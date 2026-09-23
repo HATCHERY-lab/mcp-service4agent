@@ -2,5 +2,46 @@
 name = "mcp-service4agent"
 version = "0.1.0"
 edition = "2024"
+description = "Shared MCP (Model Context Protocol) JSON-RPC server, a route-recording axum wrapper, optional single-writer SQLite storage, and optional self-registration against a service supervisor."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ZENG3LD/mcp-service4agent"
+readme = "README.md"
+keywords = ["mcp", "jsonrpc", "axum", "sqlite", "agent"]
+categories = ["web-programming::http-server", "asynchronous"]
+
+[features]
+default = []
+# Single-writer SQLite storage: `Db` (the one writer), `DbPool` (read-only,
+# query_only), `BatchWriter` (one worker thread, batched transactions,
+# SAVEPOINT per op, durability barrier), versioned migrations.
+sqlite = ["dep:rusqlite", "dep:tokio", "dep:tracing", "dep:thiserror"]
+# d-watchdog self-registration: wire-compatible manifest types plus a push
+# client for `PUT /registry/:name`. Off by default — most consumers outside
+# that environment never need it.
+nemo = ["dep:reqwest", "dep:tokio", "dep:tracing"]
 
 [dependencies]
+# Core: the MCP server and `DocRouter` are always compiled — every consumer
+# of this crate wants an MCP surface, so there is nothing to gain from
+# feature-gating axum itself.
+axum = { version = "0.8" }
+tower-layer = "0.3"
+tower-service = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# `sqlite` only.
+rusqlite = { version = "0.32", optional = true, features = ["bundled"] }
+thiserror = { version = "2", optional = true }
+
+# Shared by `sqlite` (spawn_blocking, Mutex, Semaphore) and `nemo`
+# (background reassertion task, timers).
+tokio = { version = "1", optional = true, features = ["rt", "sync", "time"] }
+tracing = { version = "0.1", optional = true }
+
+# `nemo` only.
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
