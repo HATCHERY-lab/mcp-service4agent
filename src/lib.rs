@@ -9,8 +9,11 @@
 //!   `axum::Router` that makes a route's description a required argument
 //!   instead of an afterthought.
 //! - **`sqlite`** — [`storage`]: a single-writer SQLite engine (`Db` +
-//!   `BatchWriter`) plus a read-only connection pool (`DbPool`) and
-//!   versioned migrations.
+//!   `BatchWriter`), a bounded independent-connection read pool
+//!   (`ReadPool`, with per-call deadlines and a slow-query log), a
+//!   dedicated WAL checkpoint connection (`Checkpointer`), an
+//!   `EXPLAIN QUERY PLAN` test helper (`plan_guard`), and versioned
+//!   migrations.
 //! - **`nemo`** — [`manifest`] (wire types for d-watchdog's service
 //!   registry) and [`register`] (push self-registration against `PUT
 //!   /registry/:name`). This feature integrates with d-watchdog, a

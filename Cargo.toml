@@ -1,6 +1,6 @@
 [package]
 name = "mcp-service4agent"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Shared MCP (Model Context Protocol) JSON-RPC server, a route-recording axum wrapper, optional single-writer SQLite storage, and optional self-registration against a service supervisor."
 license = "MIT OR Apache-2.0"
@@ -11,9 +11,12 @@ categories = ["web-programming::http-server", "asynchronous"]
 
 [features]
 default = []
-# Single-writer SQLite storage: `Db` (the one writer), `DbPool` (read-only,
-# query_only), `BatchWriter` (one worker thread, batched transactions,
-# SAVEPOINT per op, durability barrier), versioned migrations.
+# Single-writer SQLite storage: `Db` (the one writer), `ReadPool` (bounded
+# independent read connections, per-call deadlines, slow-query log),
+# `Checkpointer` (dedicated WAL checkpoint connection), `BatchWriter` (one
+# worker thread, batched transactions, SAVEPOINT per op, durability
+# barrier, slow-batch log), `plan_guard` (EXPLAIN QUERY PLAN test helper),
+# versioned migrations.
 sqlite = ["dep:rusqlite", "dep:tokio", "dep:tracing", "dep:thiserror"]
 # d-watchdog self-registration: wire-compatible manifest types plus a push
 # client for `PUT /registry/:name`. Off by default — most consumers outside
@@ -45,3 +48,8 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
+# Test-only: the read-deadline drop-cancellation test proves a dropped
+# future actually stops the running statement by counting steps from a
+# custom SQL scalar function — `rusqlite`'s `functions` feature is not part
+# of `bundled` and is not needed by the library itself, only by that test.
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }

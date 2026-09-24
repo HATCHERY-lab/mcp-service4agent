@@ -26,13 +26,28 @@ of a typical service's plumbing.
 
 ### `sqlite`
 
-Single-writer SQLite storage: `Db` (the one writer connection, WAL +
-foreign_keys), `DbPool` (N read-only connections, each pragma'd
-`query_only = ON` so an accidental write fails loudly instead of racing the
-writer), `BatchWriter` (one dedicated worker thread, batched transactions
-with a `SAVEPOINT` per operation, a `barrier()`/`barrier_async()`
-durability point, and live stats), and `Migration`/`MigrationRunner` (a
-versioned `schema_migrations` ledger, idempotent re-runs).
+Single-writer SQLite storage:
+
+- `Db` — the one writer connection (WAL + foreign_keys, plus an explicit
+  writer pragma budget applied at open: busy timeout, cache size,
+  `synchronous = NORMAL`, a WAL size limit, and a WAL auto-checkpoint
+  backstop).
+- `ReadPool` — a bounded set of independent read connections to the same
+  WAL file, checked out through a semaphore, with a shared page-cache
+  budget divided across the pool rather than multiplied per connection.
+  Every read carries a deadline (interrupting a runaway statement without
+  corrupting the connection) and a slow-query log with per-call-site
+  metrics.
+- `Checkpointer` — a dedicated connection for `PRAGMA wal_checkpoint`, kept
+  off the writer's own queue so a busy writer never blocks a checkpoint and
+  a checkpoint never blocks the writer.
+- `BatchWriter` — one dedicated worker thread, batched transactions with a
+  `SAVEPOINT` per operation, a `barrier()`/`barrier_async()` durability
+  point, and live stats including a slow-batch counter.
+- `plan_guard` — an `EXPLAIN QUERY PLAN` test helper that panics on a full
+  table scan, for pinning a hot query to its index.
+- `Migration`/`MigrationRunner` — a versioned `schema_migrations` ledger,
+  idempotent re-runs.
 
 ### `nemo`
 
@@ -68,6 +83,27 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 ```
+
+## Changelog
+
+### 0.2.0
+
+- **Breaking (`sqlite` feature):** `DbPool` is replaced by `ReadPool` — a
+  bounded set of independent read connections (rather than a fixed-size
+  `Vec` behind one lock) with a shared, size-derived page-cache budget,
+  per-call read deadlines, and a slow-query log. Callers of `DbPool::open`
+  / `DbPool::read` move to `ReadPool::open` / `ReadPool::read` (or
+  `ReadPoolConfig` for the full set of tuning knobs).
+- `Db::open` now applies an explicit writer-side pragma budget by default
+  (`Db::open_with_writer_pragmas` to override); `BatchWriter` gained a
+  slow-batch counter.
+- Added `Checkpointer` (dedicated WAL checkpoint connection) and
+  `plan_guard` (an `EXPLAIN QUERY PLAN` test helper), both under the
+  `sqlite` feature.
+
+### 0.1.0
+
+Initial release.
 
 ## License
 

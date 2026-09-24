@@ -34,6 +34,13 @@ use crate::storage::db::Db;
 /// isolation for a single op is the `SAVEPOINT`, not a sub-transaction.
 pub type WriteOp = Box<dyn FnOnce(&Connection) -> rusqlite::Result<()> + Send>;
 
+/// Elapsed batch-commit time past which [`run`] logs one `warn!` (label =
+/// the writer's own [`Db::label`]) and counts toward
+/// [`BatchStats::slow_batches`]. Same bar
+/// [`crate::storage::read_pool::DEFAULT_SLOW_QUERY_THRESHOLD`] uses on the
+/// read side, for the same reason: worth a look, not yet an incident.
+pub const DEFAULT_SLOW_BATCH_THRESHOLD: Duration = Duration::from_millis(250);
+
 /// Batch tuning: the ceiling on operations per commit and the quiet window
 /// before flushing a partial batch.
 #[derive(Clone, Copy, Debug)]
@@ -43,6 +50,9 @@ pub struct BatchConfig {
     /// How long to wait for the queue to grow before committing what's
     /// there.
     pub flush_window: Duration,
+    /// Commit time past which a batch counts as slow — see
+    /// [`DEFAULT_SLOW_BATCH_THRESHOLD`].
+    pub slow_batch_threshold: Duration,
 }
 
 impl Default for BatchConfig {
@@ -50,6 +60,7 @@ impl Default for BatchConfig {
         Self {
             max_ops: 256,
             flush_window: Duration::from_millis(50),
+            slow_batch_threshold: DEFAULT_SLOW_BATCH_THRESHOLD,
         }
     }
 }
@@ -63,6 +74,10 @@ pub struct BatchStats {
     pub batches: u64,
     pub last_batch_ops: u64,
     pub last_batch_dur: Duration,
+    /// Committed batches whose commit took at least
+    /// [`BatchConfig::slow_batch_threshold`] — each one also logged one
+    /// `warn!` naming the writer's own label, op count, and elapsed time.
+    pub slow_batches: u64,
 }
 
 impl BatchStats {
@@ -80,6 +95,7 @@ struct StatsInner {
     batches: AtomicU64,
     last_batch_ops: AtomicU64,
     last_batch_micros: AtomicU64,
+    slow_batches: AtomicU64,
 }
 
 enum Cmd {
@@ -146,6 +162,7 @@ impl BatchWriter {
             batches: self.stats.batches.load(Ordering::Relaxed),
             last_batch_ops: self.stats.last_batch_ops.load(Ordering::Relaxed),
             last_batch_dur: Duration::from_micros(self.stats.last_batch_micros.load(Ordering::Relaxed)),
+            slow_batches: self.stats.slow_batches.load(Ordering::Relaxed),
         }
     }
 }
@@ -158,33 +175,33 @@ fn run(db: Db, cfg: BatchConfig, rx: mpsc::Receiver<Cmd>, stats: Arc<StatsInner>
             Cmd::Op(op) => ops.push(op),
             Cmd::Barrier(b) => {
                 barriers.push(b);
-                flush(&db, &mut ops, &mut barriers, &stats);
+                flush(&db, &cfg, &mut ops, &mut barriers, &stats);
             }
         }
         loop {
             if ops.len() >= cfg.max_ops {
-                flush(&db, &mut ops, &mut barriers, &stats);
+                flush(&db, &cfg, &mut ops, &mut barriers, &stats);
             }
             match rx.recv_timeout(cfg.flush_window) {
                 Ok(Cmd::Op(op)) => ops.push(op),
                 Ok(Cmd::Barrier(b)) => {
                     barriers.push(b);
-                    flush(&db, &mut ops, &mut barriers, &stats);
+                    flush(&db, &cfg, &mut ops, &mut barriers, &stats);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => break,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    flush(&db, &mut ops, &mut barriers, &stats);
+                    flush(&db, &cfg, &mut ops, &mut barriers, &stats);
                     break 'outer;
                 }
             }
         }
-        flush(&db, &mut ops, &mut barriers, &stats);
+        flush(&db, &cfg, &mut ops, &mut barriers, &stats);
     }
 }
 
 /// One transaction per batch; each op runs under its own `SAVEPOINT` so a
 /// single op's failure is isolated.
-fn flush(db: &Db, ops: &mut Vec<WriteOp>, barriers: &mut Vec<mpsc::Sender<()>>, stats: &StatsInner) {
+fn flush(db: &Db, cfg: &BatchConfig, ops: &mut Vec<WriteOp>, barriers: &mut Vec<mpsc::Sender<()>>, stats: &StatsInner) {
     if !ops.is_empty() {
         let started = Instant::now();
         let n = ops.len() as u64;
@@ -211,13 +228,16 @@ fn flush(db: &Db, ops: &mut Vec<WriteOp>, barriers: &mut Vec<mpsc::Sender<()>>, 
         });
         match res {
             Ok(()) => {
+                let elapsed = started.elapsed();
                 stats.committed.fetch_add(committed, Ordering::Relaxed);
                 stats.failed.fetch_add(failed, Ordering::Relaxed);
                 stats.batches.fetch_add(1, Ordering::Relaxed);
                 stats.last_batch_ops.store(n, Ordering::Relaxed);
-                stats
-                    .last_batch_micros
-                    .store(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                stats.last_batch_micros.store(elapsed.as_micros() as u64, Ordering::Relaxed);
+                if elapsed >= cfg.slow_batch_threshold {
+                    stats.slow_batches.fetch_add(1, Ordering::Relaxed);
+                    warn!(label = %db.label(), ops = n, elapsed_ms = elapsed.as_millis() as u64, "slow batch commit");
+                }
             }
             Err(e) => {
                 stats.failed.fetch_add(n, Ordering::Relaxed);
@@ -297,7 +317,11 @@ mod tests {
         .expect("migration applies");
         let w = BatchWriter::new(
             db.clone(),
-            BatchConfig { max_ops: 256, flush_window: Duration::from_millis(200) },
+            BatchConfig {
+                max_ops: 256,
+                flush_window: Duration::from_millis(200),
+                ..BatchConfig::default()
+            },
         );
         w.send(Box::new(|c| {
             c.execute("INSERT INTO t VALUES (1)", [])?;
@@ -360,6 +384,75 @@ mod tests {
         drop(w);
         // Worker thread has exited; the row it committed is still there.
         assert_eq!(count_rows(&db).await, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A batch commit slower than `slow_batch_threshold` must count toward
+    /// [`BatchStats::slow_batches`] — the write-side half of the
+    /// slow-query-log instrument (see
+    /// [`crate::storage::read_pool`] for the read-side half).
+    #[tokio::test]
+    async fn slow_batch_commit_is_counted() {
+        let (db, dir) = file_db("slow-batch");
+        db.run_migrations(MigrationRunner::new(vec![Migration::new(
+            1,
+            "t",
+            "CREATE TABLE t (n INTEGER PRIMARY KEY);",
+        )]))
+        .await
+        .expect("migration applies");
+        let w = BatchWriter::new(
+            db.clone(),
+            BatchConfig {
+                max_ops: 256,
+                flush_window: Duration::from_millis(20),
+                slow_batch_threshold: Duration::from_millis(1),
+            },
+        );
+        w.send(Box::new(|c| {
+            // Comfortably over the 1ms threshold, comfortably under the
+            // 20ms flush window (so this lands in its own batch rather
+            // than being split by a max_ops flush mid-sleep).
+            std::thread::sleep(Duration::from_millis(15));
+            c.execute("INSERT INTO t VALUES (1)", [])?;
+            Ok(())
+        }));
+        assert!(w.barrier_async().await);
+        let s = w.stats();
+        assert_eq!(s.batches, 1, "one batch, so slow_batches can only be 0 or 1");
+        assert_eq!(s.slow_batches, 1, "a 15ms commit against a 1ms threshold must count as slow");
+        drop(w);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The mirror case: a batch comfortably under the threshold must NOT
+    /// be counted, so the counter tracks slowness rather than every batch.
+    #[tokio::test]
+    async fn fast_batch_commit_is_not_counted_as_slow() {
+        let (db, dir) = file_db("fast-batch");
+        db.run_migrations(MigrationRunner::new(vec![Migration::new(
+            1,
+            "t",
+            "CREATE TABLE t (n INTEGER PRIMARY KEY);",
+        )]))
+        .await
+        .expect("migration applies");
+        let w = BatchWriter::new(
+            db.clone(),
+            BatchConfig {
+                max_ops: 256,
+                flush_window: Duration::from_millis(20),
+                slow_batch_threshold: Duration::from_secs(10),
+            },
+        );
+        w.send(Box::new(|c| {
+            c.execute("INSERT INTO t VALUES (1)", [])?;
+            Ok(())
+        }));
+        assert!(w.barrier_async().await);
+        let s = w.stats();
+        assert_eq!(s.slow_batches, 0, "a fast commit against a 10s threshold must not count as slow");
+        drop(w);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -10,6 +10,7 @@
 //! async ones.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use rusqlite::Connection;
 use tokio::sync::Mutex;
@@ -17,6 +18,7 @@ use tracing::info;
 
 use crate::storage::config::DbConfig;
 use crate::storage::migrations::MigrationRunner;
+use crate::storage::writer_pragmas::{apply_writer_pragmas, WriterPragmaConfig};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -32,6 +34,15 @@ pub enum DbError {
     Join(#[from] tokio::task::JoinError),
     #[error("pool: {0}")]
     Pool(String),
+    /// [`crate::storage::read_pool::ReadPool::read_with_deadline`] (and the
+    /// default-deadline path on [`crate::storage::read_pool::ReadPool::read`]
+    /// / `read_labeled`) interrupted a statement that ran past its
+    /// deadline. The connection itself is unharmed — SQLite's own
+    /// `sqlite3_interrupt()` contract guarantees an interrupted statement
+    /// never corrupts the connection — and has already been returned to
+    /// the pool by the time this error reaches the caller.
+    #[error("read '{label}' exceeded its deadline after {elapsed:?}")]
+    Deadline { label: String, elapsed: Duration },
 }
 
 /// Cheaply-clonable SQLite handle. Clones share the underlying `Mutex`, so a
@@ -44,11 +55,23 @@ pub struct Db {
 }
 
 impl Db {
-    /// Opens the database and applies WAL (file-backed only) + foreign_keys
-    /// pragmas. Does NOT run migrations — call [`Db::run_migrations`]
+    /// Opens the database, applies WAL (file-backed only) + foreign_keys
+    /// pragmas plus the default writer pragma budget
+    /// ([`WriterPragmaConfig::default`] — busy timeout, cache size,
+    /// `synchronous=NORMAL`, journal size limit, WAL autocheckpoint
+    /// backstop). Does NOT run migrations — call [`Db::run_migrations`]
     /// separately once any caller-side backfill against the raw connection
     /// (if applicable) has had a chance to run.
     pub fn open(cfg: &DbConfig) -> Result<Self, DbError> {
+        Self::open_with_writer_pragmas(cfg, &WriterPragmaConfig::default())
+    }
+
+    /// Same as [`Self::open`], with the writer-side pragma budget
+    /// ([`WriterPragmaConfig`]) under caller control instead of the
+    /// default. Use when a store's write pattern genuinely differs from
+    /// the default's own assumptions — see that type's field docs for
+    /// what each knob trades off. Most consumers want [`Self::open`].
+    pub fn open_with_writer_pragmas(cfg: &DbConfig, pragmas: &WriterPragmaConfig) -> Result<Self, DbError> {
         let (conn, label) = match cfg {
             DbConfig::Path(path) => {
                 if let Some(parent) = path.parent()
@@ -71,8 +94,20 @@ impl Db {
             }
         };
 
+        // WAL, and the rest of the writer pragma budget, are only
+        // meaningful for file-backed connections (in-memory databases
+        // don't have a journal file, so `synchronous` / `journal_size_limit`
+        // / `wal_autocheckpoint` have nothing to act on) — but
+        // `busy_timeout` and `cache_size` are real per-connection settings
+        // either way.
         if !cfg.is_in_memory() {
             conn.pragma_update(None, "journal_mode", "WAL")
+                .map_err(DbError::Pragma)?;
+            apply_writer_pragmas(&conn, pragmas)?;
+        } else {
+            conn.pragma_update(None, "busy_timeout", pragmas.busy_timeout_ms)
+                .map_err(DbError::Pragma)?;
+            conn.pragma_update(None, "cache_size", pragmas.cache_size_kib)
                 .map_err(DbError::Pragma)?;
         }
         conn.pragma_update(None, "foreign_keys", "ON")
@@ -224,5 +259,86 @@ mod tests {
 
         drop(db);
         let _ = std::fs::remove_dir_all(&cleanup_root);
+    }
+
+    /// Every pragma [`WriterPragmaConfig::default`] states must actually
+    /// be applied and readable back off the live connection — proves the
+    /// wiring in `Db::open`, not just the config struct's own field
+    /// values.
+    #[tokio::test]
+    async fn writer_pragmas_are_applied_and_read_back() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("mcp-service4agent-db-writer-pragmas-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let defaults = WriterPragmaConfig::default();
+        let db = Db::open(&DbConfig::new(&path)).expect("db opens");
+
+        let read_db = db.clone();
+        let (busy_timeout, cache_size, synchronous, journal_size_limit, wal_autocheckpoint): (i64, i64, i64, i64, i64) =
+            tokio::task::spawn_blocking(move || {
+                read_db.read_blocking(|c| {
+                    Ok((
+                        c.query_row("PRAGMA busy_timeout", [], |r| r.get(0))?,
+                        c.query_row("PRAGMA cache_size", [], |r| r.get(0))?,
+                        c.query_row("PRAGMA synchronous", [], |r| r.get(0))?,
+                        c.query_row("PRAGMA journal_size_limit", [], |r| r.get(0))?,
+                        c.query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))?,
+                    ))
+                })
+            })
+            .await
+            .expect("join")
+            .expect("read pragmas");
+
+        assert_eq!(busy_timeout, defaults.busy_timeout_ms);
+        assert_eq!(cache_size, defaults.cache_size_kib);
+        assert_eq!(synchronous, 1, "NORMAL reports as 1");
+        assert_eq!(journal_size_limit, defaults.journal_size_limit_bytes);
+        assert_eq!(wal_autocheckpoint, defaults.wal_autocheckpoint_pages);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// [`Db::open_with_writer_pragmas`] applies a caller-chosen budget
+    /// instead of the default, proving the override path (not just that
+    /// the defaults happen to work).
+    #[tokio::test]
+    async fn open_with_writer_pragmas_applies_a_caller_chosen_budget() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("mcp-service4agent-db-writer-pragmas-custom-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let custom = WriterPragmaConfig {
+            busy_timeout_ms: 1_234,
+            cache_size_kib: -4_096,
+            journal_size_limit_bytes: 16 * 1024 * 1024,
+            wal_autocheckpoint_pages: 500,
+        };
+        let db = Db::open_with_writer_pragmas(&DbConfig::new(&path), &custom).expect("db opens with custom pragmas");
+
+        let read_db = db.clone();
+        let (busy_timeout, cache_size): (i64, i64) = tokio::task::spawn_blocking(move || {
+            read_db.read_blocking(|c| {
+                Ok((
+                    c.query_row("PRAGMA busy_timeout", [], |r| r.get(0))?,
+                    c.query_row("PRAGMA cache_size", [], |r| r.get(0))?,
+                ))
+            })
+        })
+        .await
+        .expect("join")
+        .expect("read pragmas");
+
+        assert_eq!(busy_timeout, 1_234);
+        assert_eq!(cache_size, -4_096);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 }
