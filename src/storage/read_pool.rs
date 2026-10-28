@@ -822,8 +822,7 @@ mod tests {
                     // than racing the clock's own resolution.
                     std::thread::sleep(std::time::Duration::from_millis(5));
                     let mut stmt = conn.prepare("SELECT id FROM t ORDER BY id")?;
-                    let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?.collect();
-                    rows
+                    stmt.query_map([], |r| r.get::<_, i64>(0))?.collect()
                 },
             )
             .await
@@ -871,8 +870,7 @@ mod tests {
                 |v: &Vec<i64>| v.len() as u64,
                 |conn| {
                     let mut stmt = conn.prepare("SELECT id FROM t")?;
-                    let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?.collect();
-                    rows
+                    stmt.query_map([], |r| r.get::<_, i64>(0))?.collect()
                 },
             )
             .await
@@ -903,8 +901,7 @@ mod tests {
         let result: Result<Vec<i64>, DbError> = pool
             .read_labeled("query_missing_table", None, |v: &Vec<i64>| v.len() as u64, |conn| {
                 let mut stmt = conn.prepare("SELECT id FROM this_table_does_not_exist")?;
-                let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?.collect();
-                rows
+                stmt.query_map([], |r| r.get::<_, i64>(0))?.collect()
             })
             .await;
         assert!(result.is_err(), "querying a nonexistent table must fail");
