@@ -53,6 +53,16 @@ pub struct BatchConfig {
     /// Commit time past which a batch counts as slow — see
     /// [`DEFAULT_SLOW_BATCH_THRESHOLD`].
     pub slow_batch_threshold: Duration,
+    /// How long [`BatchWriter::barrier`] waits for the queue to drain before
+    /// it gives up.
+    ///
+    /// The wait is the durability point of a run: a caller that returns
+    /// before its writes are committed reports work that is not in the index
+    /// yet, and the next run starts on top of a queue that is still deep.
+    /// Thirty seconds is enough for a service that writes a little at a
+    /// time; a run that writes a whole workspace needs more, and it says so
+    /// by setting this.
+    pub barrier_timeout: Duration,
 }
 
 impl Default for BatchConfig {
@@ -61,7 +71,20 @@ impl Default for BatchConfig {
             max_ops: 256,
             flush_window: Duration::from_millis(50),
             slow_batch_threshold: DEFAULT_SLOW_BATCH_THRESHOLD,
+            barrier_timeout: DEFAULT_BARRIER_TIMEOUT,
         }
+    }
+}
+
+/// How long a barrier waits for the queue to drain when nobody says
+/// otherwise.
+pub const DEFAULT_BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
+
+impl BatchConfig {
+    /// The same configuration, with a different barrier timeout.
+    pub fn barrier_timeout(mut self, timeout: Duration) -> Self {
+        self.barrier_timeout = timeout;
+        self
     }
 }
 
@@ -110,6 +133,8 @@ enum Cmd {
 pub struct BatchWriter {
     tx: mpsc::Sender<Cmd>,
     stats: Arc<StatsInner>,
+    /// How long a barrier waits for the queue to drain.
+    barrier_timeout: Duration,
 }
 
 impl BatchWriter {
@@ -121,11 +146,16 @@ impl BatchWriter {
         let stats = Arc::new(StatsInner::default());
         let worker_stats = stats.clone();
         let label = db.label().to_string();
+        let barrier_timeout = cfg.barrier_timeout;
         std::thread::Builder::new()
             .name(format!("mcp-service4agent-batch-{label}"))
             .spawn(move || run(db, cfg, rx, worker_stats))
             .expect("batch writer thread spawn");
-        Self { tx, stats }
+        Self {
+            tx,
+            stats,
+            barrier_timeout,
+        }
     }
 
     /// Enqueues an operation. Fire-and-forget: never blocks the caller.
@@ -139,13 +169,13 @@ impl BatchWriter {
 
     /// Durability point: blocks the calling thread until every op enqueued
     /// before this call has committed. Returns `false` if the worker is
-    /// gone or doesn't respond within 30s.
+    /// gone or doesn't respond within [`BatchConfig::barrier_timeout`].
     pub fn barrier(&self) -> bool {
         let (tx, rx) = mpsc::channel();
         if self.tx.send(Cmd::Barrier(tx)).is_err() {
             return false;
         }
-        rx.recv_timeout(Duration::from_secs(30)).is_ok()
+        rx.recv_timeout(self.barrier_timeout).is_ok()
     }
 
     /// Async wrapper over [`Self::barrier`] for tokio call sites.
@@ -407,6 +437,7 @@ mod tests {
                 max_ops: 256,
                 flush_window: Duration::from_millis(20),
                 slow_batch_threshold: Duration::from_millis(1),
+                barrier_timeout: DEFAULT_BARRIER_TIMEOUT,
             },
         );
         w.send(Box::new(|c| {
@@ -443,6 +474,7 @@ mod tests {
                 max_ops: 256,
                 flush_window: Duration::from_millis(20),
                 slow_batch_threshold: Duration::from_secs(10),
+                barrier_timeout: DEFAULT_BARRIER_TIMEOUT,
             },
         );
         w.send(Box::new(|c| {
