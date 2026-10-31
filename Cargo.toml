@@ -1,10 +1,10 @@
 [package]
 name = "mcp-service4agent"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Shared MCP (Model Context Protocol) JSON-RPC server, a route-recording axum wrapper, optional single-writer SQLite storage, and optional self-registration against a service supervisor."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/ZENG3LD/mcp-service4agent"
+repository = "https://github.com/knyaz-tishini/mcp-service4agent"
 readme = "README.md"
 keywords = ["mcp", "jsonrpc", "axum", "sqlite", "agent"]
 categories = ["web-programming::http-server", "asynchronous"]
