@@ -1,6 +1,6 @@
 [package]
 name = "mcp-service4agent"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Shared MCP (Model Context Protocol) JSON-RPC server, a route-recording axum wrapper, optional single-writer SQLite storage, and optional self-registration against a service supervisor."
 license = "MIT OR Apache-2.0"
@@ -34,10 +34,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # `sqlite` only.
-# rusqlite 0.40: one `links = "sqlite3"` package may exist in a dependency
+# rusqlite 0.36: one `links = "sqlite3"` package may exist in a dependency
 # graph, so every crate that touches SQLite has to agree on the version. The
 # memory family is on 0.40, and this crate is the storage half of it.
-rusqlite = { version = "0.40", optional = true, features = ["bundled"] }
+rusqlite = { version = "0.36", optional = true, features = ["bundled"] }
 thiserror = { version = "2", optional = true }
 
 # Shared by `sqlite` (spawn_blocking, Mutex, Semaphore) and `nemo`
@@ -55,4 +55,4 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 # future actually stops the running statement by counting steps from a
 # custom SQL scalar function — `rusqlite`'s `functions` feature is not part
 # of `bundled` and is not needed by the library itself, only by that test.
-rusqlite = { version = "0.40", features = ["bundled", "functions"] }
+rusqlite = { version = "0.36", features = ["bundled", "functions"] }
